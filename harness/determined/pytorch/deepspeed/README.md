@@ -61,6 +61,7 @@ Note how `backward` and `step` are called on the DeepSpeed model engine instead 
 If a user wants to use pipeline parallelism, they will need to pass layers of their model to 
 DeepSpeed's PipelineModule before creating the DeepSpeed model engine:
 ```python
+net = ...
 net = PipelineModule(
     layers=get_layers(net), # get_layers is a user provided function that will return layers of a network.
     loss_fn=torch.nn.CrossEntropyLoss(),
@@ -81,10 +82,11 @@ If a `dataset` is passed to `deepspeed.initialize`, the model_engine will build 
 creates batches of size `train_micro_batch_size_per_gpu`, which can be specified in the DeepSpeed config. 
 You can also create your own dataloader and use that directly.
 ```python
+model_engine.set_dataloader(train_dataloader)
 for _ in range(train_iters):
     # The model_engine will automatically perform forward, backward, and optimizer update on 
     # batches requested internally from the dataloader and interleave.  
-    model_engine.train_batch(dataloader) 
+    model_engine.train_batch() 
 ```
 
 ### Putting it together
@@ -110,6 +112,8 @@ for idx, batch in enumerate(dataloader):
 
 #### Pipeline Parallel Training
 ```python
+deepspeed.init_distributed(dist_backend=args.backend) # backend usually nccl
+net = ...
 net = PipelineModule(
     layers=get_layers(net), # get_layers is a user provided function that will return layers of a network.
     loss_fn=torch.nn.CrossEntropyLoss(),
@@ -123,15 +127,15 @@ model_engine, _, _, _ = deepspeed.initialize(
     ...
 )
 train_dataloader = ...
+model_engine.set_dataloader(train_dataloader) # creates iterator over train_dataloader stored in model_engine
 for _ in range(train_iters):
     # The model_engine will automatically perform forward, backward, and optimizer update on 
     # batches requested internally from the dataloader and interleave.  
-    model_engine.train_batch(train_dataloader) 
+    model_engine.train_batch()
 ```
 
 ## Using DeepSpeedTrial
-You can think of `DeepSpeedTrial` as a way to use an automated training loop with DeepSpeed.  
-Next, we'll demonstrate how the typical usage of DeepSpeed maps over to Determined.
+You can think of `DeepSpeedTrial` as a way to use an automated training loop with DeepSpeed. Next, we'll demonstrate how the typical usage of DeepSpeed maps over to Determined.
 
 ### Determined's Experiment Configuration
 Configuration Determined experiments for DeepSpeed is largely the same as doing so for PyTorchTrial 
@@ -153,53 +157,172 @@ hyperparameters:
   deepspeed_config: ds_config.json
   ...
 ```
+Then we can treat the hyperparameters section of the experiment config as the `args` that we pass
+to `deepspeed.initialize` with `deepspeed_config` as a field.
 
 ### Implementing the Trial API
+The example below shows the methods you need to implement for the `DeepSpeedTrial` API.  The interface
+is largely the same as that for `PyTorchTrial` with the exception that `train_batch` and `evaluate_batch` 
+take an iterator over a dataloader as input instead of a batch.  You can think of implementing
+this interface as adding additional structure to the code above with the addition of a few additional
+lines to support using DeepSpeed with Determined.
 
-#### Initializing 
+```diff
+import deepspeed
+from determined.pytorch import DataLoader, DeepSpeedTrial, DeepSpeedTrialContext
+
+class MyTrial(DeepSpeedTrial):
+    def __init__(self, context: DeepSpeedTrialContext) -> None:
++       self.context = context
++       self.args = AttrDict(self.context.get_hparams()) # Get the hyperparameters from the experiment config
+        net = ...
+        model_engine, _, _, _ = deepspeed.initialize(
+            args=self.args, # args has deepspeed_config as a field 
+            model=net, 
+            ...
+        )
+        # Register the model_engine with Determined so we can automatically support fault tolerance
+        # among other things for you behind the scenes.
++       self.model_engine = self.context.wrap_model_engine(model_engine) 
+
+    def build_training_data_loader(self) -> Any:
+        trainset = ...
+        return DataLoader(trainset, batch_size=self.context.get_micro_batch_size_per_gpu(), shuffle=True)
+
+    def build_validation_data_loader(self) -> Any:
+        valset = ...
+        return DataLoader(valset, batch_size=self.context.get_micro_batch_size_per_gpu(), shuffle=False)
+
+    def train_batch(
+        self, iter_dataloader: Iterable[DataLoader], epoch_idx: int, batch_idx: int
+    ) -> Dict[str, torch.Tensor]:
++       inputs, targets = next(iter_dataloader) # Get a batch from the iterator
+        outputs = self.model_engine(inputs)
+        loss = self.criterion(outputs, targets)
+        self.model_engine.backward(loss)
+        self.model_engine.step()
+        return {"loss": loss}
+
+    def evaluate_batch(self, iter_dataloader: Iterable[DataLoader], batch_idx: int) -> Dict[str, Any]:
++       inputs, targets = next(iter_dataloader) # Get a batch from the iterator
+        outputs = self.model_engine(inputs)
+        metric = ...
+        return {"metric": metric}
+```
+
+The process is very similar for pipeline parallel training but there won't be a need to manually
+get a batch from the iterator.
 ```diff
 import deepspeed
 from determined.pytorch import DataLoader, DeepSpeedTrial, DeepSpeedTrialContext, DeepSpeedMPU
 
 class MyTrial(DeepSpeedTrial):
     def __init__(self, context: DeepSpeedTrialContext) -> None:
-        self.context = context
-        self.args = AttrDict(self.context.get_hparams())
-        model = MyModel(...)
-        self.model_engine, _, _, _ = deepspeed.initialize(
-            args=self.args, 
-            model=model, 
++       self.context = context
++       self.args = AttrDict(self.context.get_hparams()) # Get the hyperparameters from the experiment config
+        net = ...
+        net = PipelineModule(
+            layers=get_layers(net), # get_layers is a user provided function that will return layers of a network.
+            loss_fn=torch.nn.CrossEntropyLoss(),
+            num_stages=args.pipeline_parallel_size,
             ...
         )
-+        self.mpu = self.context.wrap_mpu(DeepSpeedMPU(model_engine.mpu))
-+        self.model_engine = self.context.wrap_model_engine(model_engine)
+        model_engine, _, _, _ = deepspeed.initialize(
+            args=self.args, # args has deepspeed_config as a field 
+            model=net, 
+            ...
+        )
+        # Register the model_engine with Determined so we can automatically support fault tolerance
+        # among other things for you behind the scenes.
++       self.model_engine = self.context.wrap_model_engine(model_engine)
 
     def build_training_data_loader(self) -> Any:
         trainset = ...
-        return DataLoader(trainset, batch_size=self.args.train_micro_batch_size_per_gpu, shuffle=True)
+        return DataLoader(trainset, batch_size=self.context.get_micro_batch_size_per_gpu(), shuffle=True)
 
     def build_validation_data_loader(self) -> Any:
         valset = ...
-        return DataLoader(valset, batch_size=self.args.train_micro_batch_size_per_gpu, shuffle=False)
+        return DataLoader(valset, batch_size=self.context.get_micro_batch_size_per_gpu(), shuffle=False)
 
     def train_batch(
         self, iter_dataloader: Iterable[DataLoader], epoch_idx: int, batch_idx: int
     ) -> Dict[str, torch.Tensor]:
-        input, target = next(iter_dataloader)
-        outputs = self.model_engine(
         loss = self.model_engine.train_batch(iter_dataloader)
-        return {"loss": float(loss)}
-
-    def evaluate_batch(self, iter_dataloader: Iterable[DataLoader]) -> Dict[str, Any]:
-        loss = self.model_engine.eval_batch(iter_dataloader)
         return {"loss": loss}
+
+    def evaluate_batch(self, iter_dataloader: Iterable[DataLoader], batch_idx: int) -> Dict[str, Any]:
+        loss = self.model_engine.eval_batch(iter_dataloader)
+        return {"metric": metric}
 ```
 
+### Switching from `PyTorchTrial` to `DeepSpeedTrial`
+Adapting an existing `PyTorchTrial` to use DeepSpeed is pretty straightforward and closely mirrors
+the process for adapting existing code to use DeepSpeed outside of Determined.  First step is to switch
+over to the DeepSpeed trial and context objects.  Then, you'll need to initialize the model engine and 
+replace the context calls with the appropriately replacements.  Remember to also modify the experiment config
+to include the path to the DeepSpeed config in `hyperparameters.deepspeed_config`.
+```diff
+-class MyTrial(PyTorchTrial):
++class MyTrial(DeepSpeedTrial):
+     def __init__(self, context):
+        self.context = context
+        self.args = AttrDict(self.context.get_hparams()) # Get the hyperparameters from the experiment config
+        net = ...
+        optimizer = ...
+-       self.model = self.context.wrap_model(net)
+-       self.optimizer = self.context.wrap_optimizer(optimizer)
++       model_engine = deepspeed.initialize(
++           args=self.args,
++           model=net,
++           optimizer=optimizer,
++           ...
++       )
+        # The DeepSpeed model_engine object has the model, optimizer, and lr_scheduler (optional) as attributes
+        # so we only need to register the model_engine with Determined.
++       self.model = self.context.wrap_model_engine(model_engine)
 
-## Advanced Usage
-### Checking DeepSpeed & Determined arguments compatibility
-deepspeed.DeepSpeedConfig(args.deepspeed_config,)
+    def build_training_data_loader(self) -> Any:
+        trainset = ...
+-       return DataLoader(trainset, batch_size=self.context.get_per_slot_batch_size(), shuffle=True)
++       return DataLoader(trainset, batch_size=self.context.get_micro_batch_size_per_gpu(), shuffle=True)
 
-self.context.reconcile_ds_config(model_engine._config)
-### Overwriting DeepSpeed config arguments 
-self.context.overwrite(deepspeed)
+    def build_validation_data_loader(self) -> Any:
+        valset = ...
+-       return DataLoader(valset, batch_size=self.context.get_per_slot_batch_size(), shuffle=False)
++       return DataLoader(valset, batch_size=self.context.get_micro_batch_size_per_gpu(), shuffle=False)
+
+-    def train_batch(self, batch, epoch_idx, batch_idx):
++    def train_batch(self, iter_dataloader, epoch_idx, batch_idx):
+-       inputs, targets = batch
++       inputs, targets = next(iter_dataloader) # Get a batch from the iterator
+        outputs = self.model(inputs)
+        loss = self.criterion(outputs, targets)
+-       self.context.backward(loss)
+-       self.context.step_optimizer(self.optimizer)
++       self.model.backward(loss)
++       self.model.step()
+        return {"loss": loss}
+
+-    def evaluate_batch(self, batch, batch_idx):
++    def evaluate_batch(self, iter_dataloader, batch_idx):
+-       inputs, targets = batch
++       inputs, targets = next(iter_dataloader) # Get a batch from the iterator
+        outputs = self.model(inputs)
+        metric = ...
+        return {"metric": metric}
+```
+
+#### A note about gradient accumulation/aggregation steps
+The DeepSpeed config has a few fields that are used to determine how often the optimizer actually
+takes a step using gradients to update the model weights.  The relevant fields are:
+
+* `train_batch_size`: the total number of samples processed by all GPUs before an optimizer update
+* `train_micro_batch_size_per_gpu`: the number of samples processed in each forward and backward pass by a single GPU
+* `gradient_accumulation_steps`: the number of micro batches to process before taking a gradient step
+
+The relationship between the fields is `train_batch_size` = `data_parallel_size` * `train_micro_batch_size_per_gpu` * `gradient_accumulation_steps`.
+At least two of the three fields are required for a given DeepSpeed configuration.
+
+The training dataloaders should always return batches of size `train_micro_batch_size_per_gpu`.  Determined will automatically
+handle calling `train_batch` so that one effective batch in terms of metrics reporting is equal to processing `train_batch_size` across all GPUs.
+
