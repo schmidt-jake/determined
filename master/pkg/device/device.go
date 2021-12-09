@@ -14,7 +14,7 @@ const (
 	CPU Type = "cpu"
 	// GPU represents a CUDA device.
 	GPU Type = "gpu"
-	// ROCM represents an AMD GPU.
+	// ROCM represents an AMD GPU device.
 	ROCM Type = "rocm"
 	// ZeroSlot represents cpu devices on agents where only GPUs are modeled.
 	ZeroSlot Type = ""
